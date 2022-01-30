@@ -54,7 +54,8 @@ class WMS_Woocommerce_Multisite_Sync_Class{
         add_action( 'woocommerce_variation_set_stock', array( $this, 'wms_stock_logging' ) );
 
         //synchronize stock changes across blogs
-        add_filter( 'woocommerce_update_product_stock_query', array( $this, 'wms_sync_stock' ), 99, 4 );
+        //add_filter( 'woocommerce_update_product_stock_query', array( $this, 'wms_sync_stock' ), 99, 4 );
+        //add_filter( 'woocommerce_product_object_updated_props', array( $this, 'wms_update_props' ), 99, 2 );
     }
 
 	public function enqueue_scripts() {
@@ -308,40 +309,92 @@ class WMS_Woocommerce_Multisite_Sync_Class{
 
     public function wms_sync_stock($sql, $product_id_with_stock, $new_stock, $operation ){
         if (is_multisite()){
+            //remove filter temporarily to prevent infinite loop
+            remove_filter( 'woocommerce_update_product_stock_query', array( $this, 'wms_sync_stock' ), 99);
             
             $blogs = get_sites();
             $prod = wc_get_product($product_id_with_stock);
             $prod_sku = $prod->get_sku();
             $current_blog_id = get_current_blog_id();
 
-            //to prevent infinite loop keep track of what is being done
-            if (!array_key_exists($current_blog_id, $GLOBALS['_wms_processing_sync'][$prod_sku])){
-                $GLOBALS['_wms_processing_sync'][$prod_sku][$current_blog_id] = 'processing';
-                $GLOBALS['_wms_processing_sync'][$prod_sku]['done'] = 1;
-            }
-
             foreach( $blogs as $b ){
-                if (!array_key_exists($b->blog_id, $GLOBALS['_wms_processing_sync'][$prod_sku])){
+                if ($b->blog_id !== $current_blog_id){
 
-                    $GLOBALS['_wms_processing_sync'][$prod_sku][$b->blog_id] = 'processing';
                     switch_to_blog($b->blog_id);
                     $product_id_in_blog = wc_get_product_id_by_sku($prod_sku);
                     wc_update_product_stock($product_id_in_blog, $new_stock, $operation);
 
-                    $GLOBALS['_wms_processing_sync'][$prod_sku]['done'] += 1;
-                    //restore_current_blog();
                 }
             }
 
-            if ($GLOBALS['_wms_processing_sync'][$prod_sku]['done'] == count($blogs)){
-                $GLOBALS['_wms_processing_sync'][$prod_sku] = '';
-            }
-
+            switch_to_blog($current_blog_id);
+            //restore filter
+            add_filter( 'woocommerce_update_product_stock_query', array( $this, 'wms_sync_stock' ), 99, 4 );
         }
     
         return $sql;
 
     }
+
+    public function wms_update_props( $product, $updated_props ) {
+
+        if (is_multisite()){
+            //remove filter temporarily to prevent infinite loop
+            remove_filter( 'woocommerce_product_object_updated_props', array( $this, 'wms_update_props' ) );
+            
+            $blogs = get_sites();
+            $prod = wc_get_product($product);
+            $prod_sku = $prod->get_sku();
+            $current_blog_id = get_current_blog_id();
+
+            foreach( $blogs as $b ){
+                if ($b->blog_id !== $current_blog_id){          //we don't need to update props for the current blog
+
+                    switch_to_blog($b->blog_id);
+                    $product_id_in_blog = wc_get_product_id_by_sku($prod_sku);
+                    wc_update_product_stock($product_id_in_blog, $new_stock, $operation);
+
+                }
+            }
+
+            switch_to_blog($current_blog_id);
+
+        }
+
+		
+
+		$id = $product->get_id();
+
+		foreach ( $this->get_translations( $id ) as $tr_id ) {
+			if ( $id && $id !== $tr_id && $tr_product = wc_get_product( $tr_id ) ) {
+
+				if ( in_array( 'stock_quantity', $updated_props, true ) ) {
+					if ( $tr_product->is_type( 'variation' ) ) {
+						do_action( 'woocommerce_variation_set_stock', $tr_product );
+					} else {
+						do_action( 'woocommerce_product_set_stock', $tr_product );
+					}
+				}
+
+				if ( in_array( 'stock_status', $updated_props, true ) ) {
+					if ( $tr_product->is_type( 'variation' ) ) {
+						do_action( 'woocommerce_variation_set_stock_status', $tr_product->get_id(), $tr_product->get_stock_status(), $tr_product );
+					} else {
+						do_action( 'woocommerce_product_set_stock_status', $tr_product->get_id(), $tr_product->get_stock_status(), $tr_product );
+					}
+				}
+
+				if ( array_intersect( $updated_props, array( 'sku', 'regular_price', 'sale_price', 'date_on_sale_from', 'date_on_sale_to', 'total_sales', 'average_rating', 'stock_quantity', 'stock_status', 'manage_stock', 'downloadable', 'virtual', 'tax_status', 'tax_class' ) ) ) {
+					$this->update_lookup_table( $tr_product->get_id(), 'wc_product_meta_lookup' );
+				}
+
+				// Trigger action so 3rd parties can deal with updated props.
+				do_action( 'woocommerce_product_object_updated_props', $tr_product, $updated_props );
+			}
+		}
+
+		add_filter( 'woocommerce_product_object_updated_props', array( $this, 'wms_update_props' ), 99, 2 );
+	}
 
 }
 endif;
